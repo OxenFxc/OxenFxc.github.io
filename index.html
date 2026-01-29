@@ -8,17 +8,42 @@
         body { font-family: monospace; padding: 10px; background: #1e1e1e; color: #d4d4d4; }
         #output { background: #0d0d0d; padding: 10px; border-radius: 4px; white-space: pre-wrap; min-height: 200px; overflow: auto; }
         #input { width: 100%; padding: 8px; margin-top: 10px; background: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; box-sizing: border-box; }
-        button { padding: 8px 16px; margin-top: 10px; background: #0e639c; color: white; border: none; cursor: pointer; }
+        button { padding: 8px 16px; margin-top: 10px; background: #0e639c; color: white; border: none; cursor: pointer; margin-right: 5px; }
         button:active { background: #094771; }
+        #fileList { margin-top: 10px; background: #252526; padding: 10px; border-radius: 4px; }
+        .file-item { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; margin: 2px 0; background: #1e1e1e; border-radius: 2px; flex-wrap: wrap; }
+        .file-item span { color: #9cdcfe; flex: 1; min-width: 100px; }
+        .file-item .dir { color: #dcdcaa; }
+        .file-item button { padding: 2px 8px; margin: 0 2px; font-size: 12px; }
+        .file-item .del { background: #c53030; }
+        .file-item .mov { background: #6b7280; }
+        .file-item .ren { background: #d97706; }
+        .file-item .dl { background: #059669; }
+        .file-item .edit { background: #7c3aed; }
+        #fileInput, #importInput { display: none; }
+        .toolbar { margin-top: 10px; }
+        .toolbar button { background: #374151; }
+        #saveBtn { background: #10b981; display: none; }
+        #cancelEditBtn { background: #ef4444; display: none; }
     </style>
 </head>
 <body>
     <h2>LXCLUA WebAssembly</h2>
     <div id="output">Loading...</div>
-    <textarea id="input" rows="5" placeholder="print('Hello LXCLUA!')">print(_VERSION)
-for i=1,5 do print(i) end</textarea>
+    <textarea id="input" rows="8" placeholder="print('Hello LXCLUA!')"></textarea>
     <br>
     <button onclick="runLua()">Run</button>
+    <button onclick="document.getElementById('fileInput').click()">Upload</button>
+    <button onclick="createDir()">New Dir</button>
+    <button id="saveBtn" onclick="saveAndExit()">Save</button>
+    <button id="cancelEditBtn" onclick="cancelEdit()">Cancel</button>
+    <input type="file" id="fileInput" multiple accept=".lua,.txt" onchange="uploadFiles(this.files)">
+    <div class="toolbar">
+        <button onclick="exportWorkspace()">Export</button>
+        <button onclick="document.getElementById('importInput').click()">Import</button>
+        <input type="file" id="importInput" accept=".json" onchange="importWorkspace(this.files[0])">
+    </div>
+    <div id="fileList"></div>
 
     <script>
 // This code implements the `-sMODULARIZE` settings by taking the generated
@@ -2649,6 +2674,54 @@ if (typeof exports === 'object' && typeof module === 'object') {
     <script>
         var lua = null;
         var outputEl = document.getElementById('output');
+        var fileCache = {};
+        var savedCode = '';
+        var isEditingFile = false;
+        var currentEditFile = null;
+        
+        /**
+         * 从localStorage加载缓存文件
+         * 功能描述：页面加载时恢复之前上传的文件
+         */
+        function loadCache() {
+            try {
+                var saved = localStorage.getItem('lxclua_files');
+                if (saved) fileCache = JSON.parse(saved);
+            } catch(e) {}
+        }
+        
+        /**
+         * 保存缓存到localStorage
+         * 功能描述：持久化存储文件内容
+         */
+        function saveCache() {
+            try {
+                localStorage.setItem('lxclua_files', JSON.stringify(fileCache));
+            } catch(e) {}
+        }
+        
+        /**
+         * 恢复文件到虚拟文件系统
+         * 功能描述：WASM初始化后将缓存的文件写入FS
+         */
+        function restoreFilesToFS() {
+            var names = Object.keys(fileCache);
+            for (var i = 0; i < names.length; i++) {
+                var name = names[i];
+                if (fileCache[name] === null) {
+                    try { lua.FS.mkdir('/' + name); } catch(e) {}
+                } else {
+                    var parts = name.split('/');
+                    if (parts.length > 1) {
+                        var dir = parts.slice(0, -1).join('/');
+                        try { lua.FS.mkdir('/' + dir); } catch(e) {}
+                    }
+                    lua.FS.writeFile('/' + name, fileCache[name]);
+                }
+            }
+        }
+        
+        loadCache();
         
         var Module = {
             print: function(text) { outputEl.textContent += text + '\n'; },
@@ -2657,17 +2730,369 @@ if (typeof exports === 'object' && typeof module === 'object') {
         
         LuaModule(Module).then(function(m) {
             lua = m;
+            restoreFilesToFS();
+            updateFileList();
             outputEl.textContent = 'LXCLUA Ready!\n';
             m.callMain(['-v']);
         });
         
+        /**
+         * 运行Lua代码
+         * 功能描述：将输入框中的代码写入虚拟文件系统并执行
+         */
         function runLua() {
             if (!lua) return;
-            outputEl.textContent = '';
+            outputEl.textContent += '\n--- Run ---\n';
             var code = document.getElementById('input').value;
             lua.FS.writeFile('/tmp.lua', code);
             lua.callMain(['/tmp.lua']);
+            syncFromFS();
         }
+        
+        /**
+         * 检查是否为目录
+         * 功能描述：通过mode位运算判断是否为目录
+         * 参数说明：mode - stat返回的mode值
+         * 返回值说明：布尔值，true表示是目录
+         */
+        function isDirectory(mode) {
+            return (mode & 61440) === 16384;
+        }
+        
+        /**
+         * 同步虚拟文件系统到缓存
+         * 功能描述：将Lua io操作产生的文件变化同步到fileCache
+         */
+        function syncFromFS() {
+            try {
+                var files = lua.FS.readdir('/');
+                for (var i = 0; i < files.length; i++) {
+                    var name = files[i];
+                    if (name === '.' || name === '..' || name === 'tmp' || name === 'home' || name === 'dev' || name === 'proc' || name === 'tmp.lua') continue;
+                    try {
+                        var stat = lua.FS.stat('/' + name);
+                        if (isDirectory(stat.mode)) {
+                            if (!(name in fileCache)) {
+                                fileCache[name] = null;
+                            }
+                            syncDirFromFS(name);
+                        } else {
+                            var content = lua.FS.readFile('/' + name, { encoding: 'utf8' });
+                            fileCache[name] = content;
+                        }
+                    } catch(e) {}
+                }
+                saveCache();
+                updateFileList();
+            } catch(e) {}
+        }
+        
+        /**
+         * 递归同步目录内容
+         * 功能描述：同步指定目录下的文件到缓存
+         * 参数说明：dir - 目录路径
+         */
+        function syncDirFromFS(dir) {
+            try {
+                var files = lua.FS.readdir('/' + dir);
+                for (var i = 0; i < files.length; i++) {
+                    var name = files[i];
+                    if (name === '.' || name === '..') continue;
+                    var fullPath = dir + '/' + name;
+                    try {
+                        var stat = lua.FS.stat('/' + fullPath);
+                        if (isDirectory(stat.mode)) {
+                            if (!(fullPath in fileCache)) {
+                                fileCache[fullPath] = null;
+                            }
+                            syncDirFromFS(fullPath);
+                        } else {
+                            var content = lua.FS.readFile('/' + fullPath, { encoding: 'utf8' });
+                            fileCache[fullPath] = content;
+                        }
+                    } catch(e) {}
+                }
+            } catch(e) {}
+        }
+        
+        /**
+         * 上传文件到缓存
+         * 功能描述：读取用户选择的文件，写入虚拟文件系统以便require使用
+         * 参数说明：files - FileList对象
+         */
+        function uploadFiles(files) {
+            for (var i = 0; i < files.length; i++) {
+                var file = files[i];
+                var reader = new FileReader();
+                reader.onload = (function(f) {
+                    return function(e) {
+                        var content = e.target.result;
+                        var name = f.name;
+                        fileCache[name] = content;
+                        saveCache();
+                        if (lua) {
+                            lua.FS.writeFile('/' + name, content);
+                        }
+                        updateFileList();
+                    };
+                })(file);
+                reader.readAsText(file);
+            }
+            document.getElementById('fileInput').value = '';
+        }
+        
+        /**
+         * 更新文件列表显示
+         * 功能描述：刷新缓存文件列表UI
+         */
+        function updateFileList() {
+            var listEl = document.getElementById('fileList');
+            var names = Object.keys(fileCache);
+            if (names.length === 0) {
+                listEl.innerHTML = '';
+                return;
+            }
+            var html = '<b>Files:</b>';
+            for (var i = 0; i < names.length; i++) {
+                var name = names[i];
+                var isDir = fileCache[name] === null;
+                var cls = isDir ? 'dir' : '';
+                var icon = isDir ? '[D] ' : '';
+                var escapedName = name.replace(/'/g, "\\'");
+                html += '<div class="file-item"><span class="' + cls + '">' + icon + name + '</span>';
+                html += '<button class="del" onclick="removeFile(\'' + escapedName + '\')">X</button>';
+                html += '<button class="ren" onclick="renameFile(\'' + escapedName + '\')">Ren</button>';
+                if (!isDir) {
+                    html += '<button class="edit" onclick="editFile(\'' + escapedName + '\')">Edit</button>';
+                    html += '<button class="dl" onclick="downloadFile(\'' + escapedName + '\')">DL</button>';
+                    html += '<button class="mov" onclick="moveFile(\'' + escapedName + '\')">Move</button>';
+                }
+                html += '</div>';
+            }
+            listEl.innerHTML = html;
+        }
+        
+        /**
+         * 删除缓存文件
+         * 功能描述：从缓存和虚拟文件系统中移除指定文件
+         * 参数说明：name - 文件名
+         */
+        function removeFile(name) {
+            delete fileCache[name];
+            saveCache();
+            if (lua) {
+                try { lua.FS.unlink('/' + name); } catch(e) {}
+                try { lua.FS.rmdir('/' + name); } catch(e) {}
+            }
+            updateFileList();
+        }
+        
+        /**
+         * 创建目录
+         * 功能描述：在虚拟文件系统中创建新目录
+         */
+        function createDir() {
+            var name = prompt('Directory name:');
+            if (!name) return;
+            fileCache[name] = null;
+            saveCache();
+            if (lua) {
+                try { lua.FS.mkdir('/' + name); } catch(e) {}
+            }
+            updateFileList();
+        }
+        
+        /**
+         * 移动文件到目录
+         * 功能描述：将文件移动到指定目录
+         * 参数说明：name - 文件名
+         */
+        function moveFile(name) {
+            var dirs = [];
+            var names = Object.keys(fileCache);
+            for (var i = 0; i < names.length; i++) {
+                if (fileCache[names[i]] === null) dirs.push(names[i]);
+            }
+            if (dirs.length === 0) {
+                alert('No directories. Create one first.');
+                return;
+            }
+            var target = prompt('Move to directory (' + dirs.join(', ') + '):');
+            if (!target || !dirs.includes(target)) return;
+            var content = fileCache[name];
+            var newName = target + '/' + name.split('/').pop();
+            delete fileCache[name];
+            fileCache[newName] = content;
+            saveCache();
+            if (lua) {
+                try { lua.FS.unlink('/' + name); } catch(e) {}
+                lua.FS.writeFile('/' + newName, content);
+            }
+            updateFileList();
+        }
+        
+        /**
+         * 编辑文件内容
+         * 功能描述：将文件内容加载到编辑器中，暂存用户当前输入
+         * 参数说明：name - 文件名
+         */
+        function editFile(name) {
+            var content = fileCache[name];
+            if (content === null) return;
+            savedCode = document.getElementById('input').value;
+            isEditingFile = true;
+            currentEditFile = name;
+            document.getElementById('input').value = content;
+            document.getElementById('input').focus();
+            document.getElementById('saveBtn').style.display = 'inline-block';
+            document.getElementById('cancelEditBtn').style.display = 'inline-block';
+            outputEl.textContent = 'Editing: ' + name + '\n';
+        }
+        
+        /**
+         * 保存并退出编辑模式
+         * 功能描述：保存编辑的文件内容，恢复原始输入框内容
+         */
+        function saveAndExit() {
+            if (!isEditingFile || !currentEditFile) return;
+            var content = document.getElementById('input').value;
+            fileCache[currentEditFile] = content;
+            saveCache();
+            if (lua) {
+                lua.FS.writeFile('/' + currentEditFile, content);
+            }
+            outputEl.textContent = 'Saved: ' + currentEditFile + '\n';
+            document.getElementById('input').value = savedCode;
+            document.getElementById('saveBtn').style.display = 'none';
+            document.getElementById('cancelEditBtn').style.display = 'none';
+            isEditingFile = false;
+            currentEditFile = null;
+            savedCode = '';
+        }
+        
+        /**
+         * 取消编辑
+         * 功能描述：取消当前编辑，恢复原始输入框内容
+         */
+        function cancelEdit() {
+            if (!isEditingFile) return;
+            document.getElementById('input').value = savedCode;
+            document.getElementById('saveBtn').style.display = 'none';
+            document.getElementById('cancelEditBtn').style.display = 'none';
+            outputEl.textContent = 'Edit cancelled\n';
+            isEditingFile = false;
+            currentEditFile = null;
+            savedCode = '';
+        }
+        
+        /**
+         * 下载文件
+         * 功能描述：将虚拟文件系统中的文件下载到本地
+         * 参数说明：name - 文件名
+         */
+        function downloadFile(name) {
+            var content = fileCache[name];
+            if (content === null) return;
+            var blob = new Blob([content], { type: 'text/plain' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = name.split('/').pop();
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        
+        /**
+         * 重命名文件或目录
+         * 功能描述：修改文件或目录的名称
+         * 参数说明：name - 原文件名
+         */
+        function renameFile(name) {
+            var newName = prompt('New name:', name);
+            if (!newName || newName === name) return;
+            var content = fileCache[name];
+            delete fileCache[name];
+            fileCache[newName] = content;
+            saveCache();
+            if (lua) {
+                try { lua.FS.unlink('/' + name); } catch(e) {}
+                try { lua.FS.rmdir('/' + name); } catch(e) {}
+                if (content === null) {
+                    try { lua.FS.mkdir('/' + newName); } catch(e) {}
+                } else {
+                    lua.FS.writeFile('/' + newName, content);
+                }
+            }
+            updateFileList();
+        }
+        
+        /**
+         * 导出工作区
+         * 功能描述：将所有文件导出为JSON文件下载
+         */
+        function exportWorkspace() {
+            var data = JSON.stringify(fileCache, null, 2);
+            var blob = new Blob([data], { type: 'application/json' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = 'lxclua_workspace.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        
+        /**
+         * 导入工作区
+         * 功能描述：从JSON文件导入文件到工作区
+         * 参数说明：file - JSON文件对象
+         */
+        function importWorkspace(file) {
+            if (!file) return;
+            var reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    var data = JSON.parse(e.target.result);
+                    var names = Object.keys(data);
+                    for (var i = 0; i < names.length; i++) {
+                        var name = names[i];
+                        fileCache[name] = data[name];
+                        if (lua) {
+                            if (data[name] === null) {
+                                try { lua.FS.mkdir('/' + name); } catch(e) {}
+                            } else {
+                                var parts = name.split('/');
+                                if (parts.length > 1) {
+                                    var dir = parts.slice(0, -1).join('/');
+                                    try { lua.FS.mkdir('/' + dir); } catch(e) {}
+                                }
+                                lua.FS.writeFile('/' + name, data[name]);
+                            }
+                        }
+                    }
+                    saveCache();
+                    updateFileList();
+                    outputEl.textContent = 'Imported ' + names.length + ' files\n';
+                } catch(e) {
+                    alert('Invalid JSON file');
+                }
+            };
+            reader.readAsText(file);
+            document.getElementById('importInput').value = '';
+        }
+        
+        // Ctrl+S保存快捷键
+        document.addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.key === 's') {
+                e.preventDefault();
+                if (isEditingFile) {
+                    saveAndExit();
+                }
+            }
+        });
     </script>
 </body>
 </html>
